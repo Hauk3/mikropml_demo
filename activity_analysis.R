@@ -1,26 +1,56 @@
 library(tidyverse)
 library(lubridate)
+library(readxl)
 
 # ── 1. Load ──────────────────────────────────────────────────────────────────
 
-raw <- read_csv(
-  "data/Biochemistry_Workload_3.csv",
-  col_names = c("start_time", "end_time", "duration_mins_raw",
-                "title", "task_raw", "task_subset_raw", "project",
-                "created_by", "biochemist", "calc_duration"),
-  skip = 1,
-  col_types = cols(.default = "c")
-)
+# Accepts CSV (Workload_3 format) or Excel (SharePoint export format)
+data_file <- "data/query_4.xlsx"
+
+if (str_ends(data_file, "\\.xlsx|\\.xls")) {
+  raw <- read_excel(data_file)
+  # Normalise SharePoint column names to match CSV schema
+  raw <- raw %>%
+    rename_with(~ case_when(
+      . == "Start Time"            ~ "start_time",
+      . == "End Time"              ~ "end_time",
+      . == "...or Duration (mins)" ~ "duration_mins_raw",
+      . == "Title"                 ~ "title",
+      . == "Task"                  ~ "task_raw",
+      . == "Task Subset"           ~ "task_subset_raw",
+      . == "Project"               ~ "project",
+      . == "Created By"            ~ "created_by",
+      . == "Biochemist"            ~ "biochemist",
+      . == "Calculated Duration"   ~ "calc_duration",
+      TRUE                         ~ .
+    )) %>%
+    mutate(across(everything(), as.character))
+  sharepoint_format <- TRUE
+} else {
+  raw <- read_csv(
+    data_file,
+    col_names = c("start_time", "end_time", "duration_mins_raw",
+                  "title", "task_raw", "task_subset_raw", "project",
+                  "created_by", "biochemist", "calc_duration"),
+    skip = 1,
+    col_types = cols(.default = "c")
+  )
+  sharepoint_format <- FALSE
+}
 
 # ── 2. Parse times & durations ───────────────────────────────────────────────
 
 df <- raw %>%
   mutate(
-    start_dt          = mdy_hm(start_time),
-    end_dt            = mdy_hm(end_time),
-    dur_explicit      = as.numeric(duration_mins_raw),
-    dur_from_times    = as.numeric(difftime(end_dt, start_dt, units = "mins")),
-    duration_mins     = if_else(!is.na(end_dt), dur_from_times, dur_explicit)
+    start_dt       = if_else(sharepoint_format,
+                             ymd_hms(start_time, tz = "UTC"),
+                             mdy_hm(start_time)),
+    end_dt         = if_else(sharepoint_format,
+                             ymd_hms(end_time, tz = "UTC"),
+                             mdy_hm(end_time)),
+    dur_explicit   = as.numeric(duration_mins_raw),
+    dur_from_times = as.numeric(difftime(end_dt, start_dt, units = "mins")),
+    duration_mins  = if_else(!is.na(end_dt), dur_from_times, dur_explicit)
   )
 
 skipped <- df %>% filter(is.na(duration_mins) | duration_mins <= 0)
@@ -57,19 +87,26 @@ tracked <- df %>%
 message("\n── Tracked time (wall-clock, de-overlapped) ──")
 tracked %>% mutate(hours = round(wall_clock_mins / 60, 1)) %>% print()
 
-# ── 4. Parse JSON-ish tag arrays ─────────────────────────────────────────────
+# ── 4. Parse multi-value tag arrays ──────────────────────────────────────────
 
-parse_tags <- function(x) {
-  x %>%
-    str_remove_all('\\[|\\]|"') %>%
-    str_split(",") %>%
-    lapply(function(v) str_trim(v[nchar(str_trim(v)) > 0]))
+# CSV format uses JSON-like ["Tag A","Tag B"]; SharePoint Excel uses "Tag1;#Tag2"
+parse_tags <- function(x, sharepoint = FALSE) {
+  if (sharepoint) {
+    x %>%
+      str_split(";#") %>%
+      lapply(function(v) str_trim(v[nchar(str_trim(v)) > 0]))
+  } else {
+    x %>%
+      str_remove_all('\\[|\\]|"') %>%
+      str_split(",") %>%
+      lapply(function(v) str_trim(v[nchar(str_trim(v)) > 0]))
+  }
 }
 
 df <- df %>%
   mutate(
-    tasks        = parse_tags(task_raw),
-    task_subsets = parse_tags(task_subset_raw)
+    tasks        = parse_tags(task_raw,        sharepoint = sharepoint_format),
+    task_subsets = parse_tags(task_subset_raw, sharepoint = sharepoint_format)
   )
 
 # ── 5. Summarise by task category ────────────────────────────────────────────
@@ -115,7 +152,7 @@ daily <- df %>%
 message("\n── Daily tracked time ──")
 daily %>% mutate(hours = round(raw_sum_mins / 60, 1)) %>% print(n = Inf)
 
-# ── 8. Average daily time with range ───────────────────────────────────────────
+# ── 8. Average daily time with range ─────────────────────────────────────────
 
 daily_stats <- daily %>%
   group_by(created_by) %>%
@@ -179,7 +216,7 @@ rg_by_type <- df_rg %>%
   arrange(desc(raw_mins))
 
 message("\n── Report generation by type (total) ──")
-rg_by_type %>% select(report_type, hours, pct) %>% print(n = Inf)
+rg_by_type %>% select(created_by, report_type, hours, pct) %>% print(n = Inf)
 
 rg_weekly <- df_rg %>%
   group_by(created_by, week, report_type) %>%
@@ -193,7 +230,37 @@ rg_weekly_wide <- rg_weekly %>%
 message("\n── Report generation by type per week ──")
 print(rg_weekly_wide, width = Inf)
 
-# ── 10. Save ──────────────────────────────────────────────────────────────────
+# ── 10. Sign-out averages (days when reported) ────────────────────────────────
+
+signout_subsets <- c(
+  "Sign Out - Protein Electrophoresis",
+  "Sign Out - HbA1c"
+)
+
+signout_daily <- df %>%
+  select(created_by, start_dt, duration_mins, task_subsets) %>%
+  unnest(task_subsets) %>%
+  filter(task_subsets %in% signout_subsets) %>%
+  mutate(date = as_date(start_dt)) %>%
+  group_by(created_by, task_subsets, date) %>%
+  summarise(day_mins = sum(duration_mins), .groups = "drop")
+
+signout_stats <- signout_daily %>%
+  group_by(created_by, task_subset = task_subsets) %>%
+  summarise(
+    days_reported = n(),
+    mean_h        = round(mean(day_mins) / 60, 2),
+    median_h      = round(median(day_mins) / 60, 2),
+    min_h         = round(min(day_mins) / 60, 2),
+    max_h         = round(max(day_mins) / 60, 2),
+    .groups = "drop"
+  ) %>%
+  arrange(task_subset, created_by)
+
+message("\n── Sign-out averages (days when reported) ──")
+print(signout_stats, width = Inf)
+
+# ── 11. Save ──────────────────────────────────────────────────────────────────
 
 write_csv(task_summary,       "data/task_summary.csv")
 write_csv(subset_summary,     "data/task_subset_summary.csv")
@@ -201,5 +268,6 @@ write_csv(daily,              "data/daily_summary.csv")
 write_csv(daily_stats,        "data/daily_stats.csv")
 write_csv(rg_by_type,         "data/report_gen_by_type.csv")
 write_csv(rg_weekly_wide,     "data/report_gen_weekly_by_type.csv")
+write_csv(signout_stats,      "data/signout_stats.csv")
 
 message("\nDone. CSVs written to data/")
