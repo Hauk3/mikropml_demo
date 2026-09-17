@@ -57,8 +57,17 @@ skipped <- df %>% filter(is.na(duration_mins) | duration_mins <= 0)
 message(sprintf("Skipping %d rows with no usable duration:", nrow(skipped)))
 skipped %>% select(start_time, title) %>% print()
 
+overnight <- df %>% filter(!is.na(duration_mins) & duration_mins > 1440)
+if (nrow(overnight) > 0) {
+  message(sprintf("\nRemoving %d overnight/multi-day entries (duration > 24 h):", nrow(overnight)))
+  overnight %>%
+    mutate(duration_h = round(duration_mins / 60, 1)) %>%
+    select(created_by, start_time, title, duration_h) %>%
+    print()
+}
+
 df <- df %>%
-  filter(!is.na(start_dt), !is.na(duration_mins), duration_mins > 0) %>%
+  filter(!is.na(start_dt), !is.na(duration_mins), duration_mins > 0, duration_mins <= 1440) %>%
   mutate(end_dt_derived = start_dt + dminutes(duration_mins))
 
 # ── 3. Wall-clock tracked time (de-overlapped per biochemist) ─────────────────
